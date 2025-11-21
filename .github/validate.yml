@@ -1,0 +1,61 @@
+name: Validate PowerShell Scripts
+
+on:
+  push:
+    paths:
+      - '**/*.ps1'
+  pull_request:
+    paths:
+      - '**/*.ps1'
+
+jobs:
+  pwsh-syntax-check:
+    name: PowerShell Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PowerShell
+        uses: PowerShell/PowerShell@v2
+        with:
+          version: '7.4.1'
+
+      - name: Run PowerShell strict syntax check
+        shell: pwsh
+        run: |
+          Write-Host "Checking PowerShell syntax..."
+          $scripts = Get-ChildItem -Recurse -Filter *.ps1
+          foreach ($s in $scripts) {
+            Write-Host "Checking $($s.FullName)"
+            try {
+              # Parse-only: don't execute
+              $null = [System.Management.Automation.Language.Parser]::ParseFile(
+                $s.FullName,
+                [ref]$null,
+                [ref]$null
+              )
+            } catch {
+              Write-Error "Syntax error in $($s.FullName): $_"
+              exit 1
+            }
+          }
+          Write-Host "All scripts parsed successfully!"
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer (linting)
+        shell: pwsh
+        run: |
+          Write-Host "Running ScriptAnalyzer..."
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning,Error
+          if ($results) {
+            $results | Format-Table
+            Write-Error "PSScriptAnalyzer found issues."
+            exit 1
+          }
+          Write-Host "No ScriptAnalyzer issues found."
