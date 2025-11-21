@@ -1,4 +1,4 @@
-name: Validate PowerShell Scripts
+name: PowerShell Syntax & Lint Check
 
 on:
   push:
@@ -9,53 +9,29 @@ on:
       - '**/*.ps1'
 
 jobs:
-  pwsh-syntax-check:
-    name: PowerShell Syntax Check
+  lint-with-PSScriptAnalyzer:
+    name: Install and run PSScriptAnalyzer
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Install PowerShell
-        uses: PowerShell/PowerShell@v2
-        with:
-          version: '7.4.1'
-
-      - name: Run PowerShell strict syntax check
+      - name: Install PSScriptAnalyzer module
         shell: pwsh
         run: |
-          Write-Host "Checking PowerShell syntax..."
-          $scripts = Get-ChildItem -Recurse -Filter *.ps1
-          foreach ($s in $scripts) {
-            Write-Host "Checking $($s.FullName)"
-            try {
-              # Parse-only: don't execute
-              $null = [System.Management.Automation.Language.Parser]::ParseFile(
-                $s.FullName,
-                [ref]$null,
-                [ref]$null
-              )
-            } catch {
-              Write-Error "Syntax error in $($s.FullName): $_"
-              exit 1
-            }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -ErrorAction Stop
+
+      - name: Lint with PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse
+
+          $errors   = $issues | Where-Object { $_.Severity -eq 'Error' }
+          $warnings = $issues | Where-Object { $_.Severity -eq 'Warning' }
+
+          Write-Output "PSScriptAnalyzer found $($errors.Count) errors and $($warnings.Count) warnings."
+
+          if ($errors.Count -gt 0) {
+            Write-Error "Failing due to PowerShell linting errors."
           }
-          Write-Host "All scripts parsed successfully!"
-
-      - name: Install PSScriptAnalyzer
-        shell: pwsh
-        run: |
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-
-      - name: Run PSScriptAnalyzer (linting)
-        shell: pwsh
-        run: |
-          Write-Host "Running ScriptAnalyzer..."
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning,Error
-          if ($results) {
-            $results | Format-Table
-            Write-Error "PSScriptAnalyzer found issues."
-            exit 1
-          }
-          Write-Host "No ScriptAnalyzer issues found."
