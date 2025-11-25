@@ -9,29 +9,27 @@
 Write-Host "[Cycle] Applying network configuration..."
 
 # ----------------------------------------------------------------------
-# 1. Locate the config-drive containing cloud-init metadata
+# 1. Locate config-drive
 # ----------------------------------------------------------------------
 $cd = Get-CimInstance Win32_LogicalDisk |
-      Where-Object { $_.DriveType -eq 5 -and $_.VolumeName -match 'cidata|config-2' }
+      Where-Object { $_.DriveType -eq 5 -and $_.VolumeName -match "cidata|config-2" }
 
 if (-not $cd) {
     Write-Error "[Cycle] Could not find config-drive."
     exit 1
 }
 
-$drive   = $cd.DeviceID
-$cfgPath = Join-Path $drive "network-config"
+$cfgPath = Join-Path $cd.DeviceID "network-config"
 
 if (-not (Test-Path $cfgPath)) {
-    Write-Error "[Cycle] network-config not found on $drive"
+    Write-Error "[Cycle] network-config not found on $($cd.DeviceID)"
     exit 1
 }
 
-Write-Host "[Cycle] Found network-config on $drive"
-
+Write-Host "[Cycle] Found network-config on drive $($cd.DeviceID)"
 
 # ----------------------------------------------------------------------
-# 2. Minimal YAML parser (PowerShell 5-compatible)
+# 2. Minimal YAML parser
 # ----------------------------------------------------------------------
 function Convert-YamlSimple {
     param([string]$Yaml)
@@ -40,8 +38,8 @@ function Convert-YamlSimple {
     $root  = @{}
     $stack = @(@{ obj = $root; indent = -1 })
 
-    foreach ($rawLine in $lines) {
-        $line = $rawLine.Replace("`r","")
+    foreach ($raw in $lines) {
+        $line = $raw.Replace("`r","")
         if ($line.Trim() -eq "" -or $line.Trim().StartsWith("#")) { continue }
 
         $indent = ($line.Length - $line.TrimStart().Length)
@@ -50,9 +48,9 @@ function Convert-YamlSimple {
         while ($stack[-1].indent -ge $indent) {
             $stack = $stack[0..($stack.Count - 2)]
         }
+
         $parent = $stack[-1].obj
 
-        # List item "- ..."
         if ($trim -match "^- (.+)$") {
             $val = $matches[1]
 
@@ -60,21 +58,18 @@ function Convert-YamlSimple {
                 $parent["_list"] = New-Object System.Collections.ArrayList
             }
 
-            # "- key: value"
             if ($val -match "^([^:]+):\s+(.+)$") {
                 $obj = @{}
                 $obj[$matches[1]] = $matches[2]
                 $parent["_list"].Add($obj) | Out-Null
                 $stack += ,@{ obj = $obj; indent = $indent }
-                continue
             }
-
-            # "- scalar"
-            $parent["_list"].Add($val) | Out-Null
+            else {
+                $parent["_list"].Add($val) | Out-Null
+            }
             continue
         }
 
-        # "key:"
         if ($trim -match "^([^:]+):\s*$") {
             $key = $matches[1]
             $obj = @{}
@@ -83,14 +78,12 @@ function Convert-YamlSimple {
             continue
         }
 
-        # "key: value"
         if ($trim -match "^([^:]+):\s+(.+)$") {
             $parent[$matches[1]] = $matches[2]
             continue
         }
     }
 
-    # Fixup: convert "_list" placeholders
     function Fixup($node) {
         foreach ($k in @($node.Keys)) {
             if ($node[$k] -is [System.Collections.IDictionary]) {
@@ -106,155 +99,189 @@ function Convert-YamlSimple {
     return $root
 }
 
-function Normalize-Mac($mac) {
-    if (-not $mac) { return "" }
-    $m = $mac -replace '-', ':' -replace '\.', ':'
-    return $m.ToLower()
+function Normalize-Mac($m) {
+    if (-not $m) { return "" }
+    return ($m -replace "-", ":" -replace "\.", ":" ).ToLower()
 }
 
-
 # ----------------------------------------------------------------------
-# 3. Load and parse cloud-init YAML
+# 3. Load YAML
 # ----------------------------------------------------------------------
 $yamlText = Get-Content $cfgPath -Raw
 $cfg      = Convert-YamlSimple $yamlText
-
-if (-not $cfg["ethernets"]) {
-    Write-Error "[Cycle] YAML parsed but no 'ethernets' section found!"
-    exit 1
-}
-
 $ethernets = $cfg["ethernets"]
 
-
-# ----------------------------------------------------------------------
-# 4. Print ethernet entries so user can confirm mapping
-# ----------------------------------------------------------------------
-Write-Host "[Cycle] NICs defined in network-config:"
-foreach ($key in $ethernets.Keys) {
-    $mac = $ethernets[$key]["match"]["macaddress"]
-    $set = $ethernets[$key]["set-name"]
-    Write-Host "  - $key → MAC $mac → rename '$set'"
+Write-Host "[Cycle] NICs in YAML:"
+foreach ($k in $ethernets.Keys) {
+    $m = $ethernets[$k]["match"]["macaddress"]
+    $n = $ethernets[$k]["set-name"]
+    Write-Host "  Key=$k  MAC=$m  Name=$n"
 }
 
+# ----------------------------------------------------------------------
+# 4. Single-phase rename using MAC only
+# ----------------------------------------------------------------------
 
-# ----------------------------------------------------------------------
-# 5. Determine rename order (eth1 before eth0)
-# ----------------------------------------------------------------------
-$renameOrder = $ethernets.Keys | Sort-Object {
-    if ($_ -eq "eth1") { return 0 }
-    if ($_ -eq "eth0") { return 1 }
-    return 2
-}
+function Wait-ForRename($targetName, $ifIndex) {
+    for ($i = 0; $i -lt 20; $i++) {
+        $nic = Get-NetAdapter -ErrorAction SilentlyContinue |
+               Where-Object { $_.ifIndex -eq $ifIndex }
 
-
-# ----------------------------------------------------------------------
-# 6. Convert CIDR prefix → IPv4 dotted-netmask
-# ----------------------------------------------------------------------
-function PrefixToMask([int]$prefix) {
-    $mask = [uint32]0
-    for ($i = 0; $i -lt $prefix; $i++) {
-        $mask = $mask -bor (1 -shl (31 - $i))
+        if ($nic -and $nic.Name -eq $targetName) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 200
     }
-    $bytes = [BitConverter]::GetBytes([UInt32]$mask)
-    return ($bytes[3], $bytes[2], $bytes[1], $bytes[0] -join ".")
+    return $false
 }
 
+Write-Host ""
+Write-Host "[Cycle] Starting single-phase renaming..."
+Write-Host ""
 
-# ----------------------------------------------------------------------
-# 7. Apply the network configuration
-# ----------------------------------------------------------------------
-foreach ($nicKey in $renameOrder) {
+foreach ($key in $ethernets.Keys) {
 
-    $entry = $ethernets[$nicKey]
+    $targetMac = Normalize-Mac $ethernets[$key]["match"]["macaddress"]
+    $finalName = $ethernets[$key]["set-name"]
 
-    if (-not $entry["match"]) { continue }
-
-    $targetMac = Normalize-Mac $entry["match"]["macaddress"]
     $nic = Get-NetAdapter | Where-Object {
-        Normalize-Mac $_.MacAddress -eq $targetMac
+        (Normalize-Mac $_.MacAddress) -eq $targetMac
     }
 
     if (-not $nic) {
-        Write-Error "[Cycle] No NIC found for MAC $targetMac"
+        Write-Error "[Error] Could not find NIC with MAC $targetMac"
         continue
     }
 
-    $nicName = $nic.Name
-    $newName = $entry["set-name"]
-
-    # Rename NIC safely
-    if ($newName -and $newName.Trim() -ne "") {
-        $exists = Get-NetAdapter -Name $newName -ErrorAction SilentlyContinue
-        if ($exists) {
-            Write-Host "[Cycle] Skipping rename: '$newName' already exists"
-        } else {
-            Rename-NetAdapter -Name $nicName -NewName $newName -ErrorAction Stop
-        }
-        $nicName = $newName.Trim()
+    if ($nic.Name -eq $finalName) {
+        Write-Host "[Cycle] NIC with MAC $targetMac is already named $finalName"
+        continue
     }
 
-    Write-Host "[Cycle] Configuring NIC $nicName (MAC $targetMac)"
+    Write-Host "[Cycle] Renaming NIC ifIndex=$($nic.ifIndex) MAC=$targetMac to $finalName"
+    Rename-NetAdapter -Name $nic.Name -NewName $finalName -ErrorAction Stop
 
-    $quoted = '"' + $nicName + '"'
+    if (-not (Wait-ForRename $finalName $nic.ifIndex)) {
+        Write-Error "[Error] Rename verification failed for ifIndex $($nic.ifIndex)"
+        continue
+    }
 
-    # Reset existing config
-    netsh interface ip   set address name=$quoted source=dhcp
+    Write-Host "[Cycle] Verified rename of ifIndex $($nic.ifIndex) to $finalName"
+}
+
+Write-Host ""
+Write-Host "[Cycle] Renaming done. Starting IP configuration..."
+Write-Host ""
+
+# ----------------------------------------------------------------------
+# 5. IP configuration
+# ----------------------------------------------------------------------
+
+function PrefixToMask([int]$prefix) {
+    $mask = [uint32]0
+    for ($i = 0; $i -lt $prefix; $i++) { $mask = $mask -bor (1 -shl (31 - $i)) }
+    $b = [BitConverter]::GetBytes([UInt32]$mask)
+    return ($b[3],$b[2],$b[1],$b[0] -join ".")
+}
+
+foreach ($key in $ethernets.Keys) {
+
+    $entry     = $ethernets[$key]
+    $finalName = $entry["set-name"]
+    $quoted    = '"' + $finalName + '"'
+
+    Write-Host ""
+    Write-Host "[Cycle] Configuring $finalName..."
+
+    # Reset IPv4 DHCP
+    Write-Host "  [Action] Reset IPv4 to DHCP"
+    netsh interface ip set address name=$quoted source=dhcp
+
+    # Reset IPv6
+    Write-Host "  [Action] Reset IPv6 stack"
     netsh interface ipv6 reset | Out-Null
 
-    # ---------------------- IP addresses ----------------------
+    # IPs
     foreach ($addr in $entry["addresses"]) {
-        $parts  = $addr -split "/"
-        $ip     = $parts[0]
-        $prefix = [int]$parts[1]
+        $parts = $addr -split "/"
+        $ip    = $parts[0]
+        $pre   = [int]$parts[1]
 
         if ($ip -like "*:*") {
-            Write-Host "  + IPv6: $ip/$prefix"
-            netsh interface ipv6 add address $quoted $ip/$prefix
+            Write-Host "  [Action] Add IPv6 address $ip/$pre"
+            netsh interface ipv6 add address $quoted $ip/$pre
         }
         else {
-            $mask = PrefixToMask $prefix
-            Write-Host "  + IPv4: $ip/$prefix (netmask $mask)"
+            $mask = PrefixToMask $pre
+            Write-Host "  [Action] Add IPv4 address $ip mask=$mask"
             netsh interface ip add address $quoted $ip $mask
         }
     }
 
-    # ---------------------- Routes ----------------------------
+    # Routes
     foreach ($r in $entry["routes"]) {
         $to     = $r["to"]
         $via    = $r["via"]
         $metric = $r["metric"]
 
         if ($to -like "*:*") {
-            $gateway = ($via -eq "::0") ? "" : $via
-            Write-Host "  + IPv6 route: $to via $gateway metric=$metric"
-            netsh interface ipv6 add route $to $quoted $gateway metric=$metric
+            if ($via -eq "::0") {
+                Write-Host "  [Action] Add IPv6 route to=$to metric=$metric"
+                netsh interface ipv6 add route $to $finalName metric=$metric
+            } else {
+                Write-Host "  [Action] Add IPv6 route to=$to via=$via metric=$metric"
+                netsh interface ipv6 add route $to $finalName $via metric=$metric
+            }
         }
         else {
-            $gateway = ($via -eq "0.0.0.0") ? "" : $via
-            Write-Host "  + IPv4 route: $to via $gateway metric=$metric"
-            netsh interface ip add route $to $quoted $gateway metric=$metric
+            if ($via -eq "0.0.0.0") {
+                Write-Host "  [Action] Add IPv4 route to=$to via=0.0.0.0 metric=$metric"
+                netsh interface ip add route $to $finalName 0.0.0.0 metric=$metric
+            } else {
+                Write-Host "  [Action] Add IPv4 route to=$to via=$via metric=$metric"
+                netsh interface ip add route $to $finalName $via metric=$metric
+            }
         }
     }
 
-    # ---------------------- DNS ------------------------------
+    # DNS (split IPv4/IPv6)
     if ($entry["nameservers"] -and $entry["nameservers"]["addresses"]) {
-        $dnsList = $entry["nameservers"]["addresses"]
-        Write-Host "  + DNS: $($dnsList -join ", ")"
 
-        netsh interface ip set dns name=$quoted static $dnsList[0] primary
-        for ($i = 1; $i -lt $dnsList.Count; $i++) {
-            netsh interface ip add dns name=$quoted $dnsList[$i] index=($i + 1)
+        $dns4 = @()
+        $dns6 = @()
+
+        foreach ($dns in $entry["nameservers"]["addresses"]) {
+            if ($dns -like "*:*") { $dns6 += $dns }
+            else { $dns4 += $dns }
+        }
+
+        if ($dns4.Count -gt 0) {
+            Write-Host "  [Action] Set primary IPv4 DNS to $($dns4[0])"
+            netsh interface ip set dns name=$quoted static $dns4[0] primary
+
+            for ($i = 1; $i -lt $dns4.Count; $i++) {
+                Write-Host "  [Action] Add IPv4 DNS server $($dns4[$i])"
+                netsh interface ip add dns name=$quoted $dns4[$i] index=($i+1)
+            }
+        }
+
+        if ($dns6.Count -gt 0) {
+            Write-Host "  [Action] Set primary IPv6 DNS to $($dns6[0])"
+            netsh interface ipv6 set dnsservers $finalName static $dns6[0] primary
+
+            for ($i = 1; $i -lt $dns6.Count; $i++) {
+                Write-Host "  [Action] Add IPv6 DNS server $($dns6[$i])"
+                netsh interface ipv6 add dnsservers $finalName $dns6[$i] validate=no
+            }
         }
     }
 
-    # ---------------------- MTU ------------------------------
+    # MTU
     if ($entry["mtu"]) {
-        Write-Host "  + MTU = $($entry["mtu"])"
+        Write-Host "  [Action] Set MTU to $($entry["mtu"])"
         netsh interface ipv4 set subinterface $quoted mtu=$($entry["mtu"]) store=persistent
     }
-
-    Write-Host "[Cycle] Finished NIC $nicName"
 }
 
+Write-Host ""
 Write-Host "[Cycle] Network configuration applied successfully."
