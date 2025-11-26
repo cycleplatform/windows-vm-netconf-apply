@@ -54,8 +54,7 @@ jobs:
         with:
           name: cycle-utils-iso
           path: cycle-utils.iso
-          # you can omit this to use repo default, or set a number of days
-          # retention-days: 90
+          retention-days: 0   # permanent
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
