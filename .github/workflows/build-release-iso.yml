@@ -34,12 +34,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y xorriso
       - name: Create ISO image
         run: |
-          mkdir iso-content
-          find . -maxdepth 1 -name "*.ps1" -exec cp {} iso-content/ \;
-          
-          VOL_LABEL="CYCLE-HELPERS-${{ github.event.inputs.version }}"
-          
-          xorriso -as mkisofs \
+            mkdir iso-content
+
+            # Include all PS1 files
+            find . -maxdepth 1 -name "*.ps1" -exec cp {} iso-content/ \;
+
+            cp version.txt iso-content/
+
+            VOL_LABEL="CYCLE-HELPERS-${{ github.event.inputs.version }}"
+
+            xorriso -as mkisofs \
             -V "$VOL_LABEL" \
             -o cycle-helpers.iso \
             iso-content

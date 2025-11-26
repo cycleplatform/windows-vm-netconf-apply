@@ -125,7 +125,7 @@ foreach ($k in $ethernets.Keys) {
 }
 
 # ----------------------------------------------------------------------
-# 4. Single-phase rename using MAC only
+# 4. Rename NICs to match
 # ----------------------------------------------------------------------
 
 function Wait-ForRename($targetName, $ifIndex) {
@@ -142,7 +142,7 @@ function Wait-ForRename($targetName, $ifIndex) {
 }
 
 Write-Host ""
-Write-Host "[Cycle] Starting single-phase renaming..."
+Write-Host "[Cycle] Renaming NICs..."
 Write-Host ""
 
 foreach ($key in $ethernets.Keys) {
