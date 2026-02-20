@@ -56,3 +56,12 @@ Expected output example:
 
 This script reads the Linux-style network-config file from the VM’s config-drive and applies the full network setup to Windows. It parses the YAML, matches adapters by MAC address, renames NICs if specified, and configures IPv4/IPv6 addresses, routes, DNS, and MTU values using netsh.
 
+### Setup task on windows boot
+
+Setup a windows scheduled task to always run netconf-apply on system boot.
+
+```powershell
+F:\netconf-apply-onboot.ps1
+```
+
+This will add a cycleio directory and script on your systemdrive along with a scheduled task to always apply netconf-apply.ps1 on system startup. This is recommended as networking configuration can change between stopping and starting your VM.
